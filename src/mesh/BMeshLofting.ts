@@ -1,6 +1,6 @@
 // ============================================================
-// B-Mesh Cross-section Lofting — 개선된 구현
-// 접합점에서 링을 공유하여 연속 메시 생성
+// B-Mesh Cross-section Lofting — 튜브 관통 + 정점 용접 방식
+// 분기점에서 튜브를 관통시키고 정점 용접으로 자연스러운 접합
 // ============================================================
 
 import type { BoneStructure, Bone, BoneConnection, MeshData, Vec3 } from './types';
@@ -108,27 +108,57 @@ function getNeighborIds(boneId: string, connections: BoneConnection[]): string[]
   return neighbors;
 }
 
-// ─── 핵심: 연속 튜브 생성 ──────────────────────────────
+// ─── 핵심: 연속 튜브 생성 (분기점 관통 포함) ─────────────
 
 /**
  * 본 체인(leaf→...→branch 또는 leaf→...→leaf)을 따라 연속 튜브 생성.
- * 각 본 위치에 하나의 공유 링을 만들어 인접 세그먼트가 정점을 공유한다.
+ * 분기점(degree >= 3)이 체인 끝에 있으면, 튜브를 분기점 중심 안쪽으로
+ * 약간 더 연장하여 여러 튜브가 분기점에서 겹치도록 한다.
  */
 function generateChainTube(
   b: MeshBuilder,
-  chain: Bone[],   // 연속 본 배열 (최소 2개)
+  chain: Bone[],
   density: number,
   segments: number,
+  adjacency: Map<string, string[]>,
 ): { startRing: Vec3[]; endRing: Vec3[]; startIndices: number[]; endIndices: number[] } {
-  // 체인 전체 방향으로 일관된 기저 벡터 계산
   const overallDir = normalize(sub(chain[chain.length - 1].position, chain[0].position));
   const [baseU, baseV] = orthonormalBasis(overallDir);
 
-  // 각 본 위치에 링 생성
+  // 체인 시작/끝이 분기점인지 확인
+  const startDeg = adjacency.get(chain[0].id)?.length ?? 0;
+  const endDeg = adjacency.get(chain[chain.length - 1].id)?.length ?? 0;
+  const startIsBranch = startDeg >= 3;
+  const endIsBranch = endDeg >= 3;
+
+  // 관통 깊이/테이퍼 설정
+  const penetrationSteps = 3;       // 관통 링 개수
+  const penetrationMaxDepth = 0.5;  // 최대 관통 깊이 (반지름 비율)
+  const penetrationMinRadius = 0.3; // 관통 끝 반지름 비율
+
+  // 각 본 위치에 링 생성 (분기점이면 관통 위치 추가)
   const boneRings: Vec3[][] = [];
+  const ringColors: Vec3[] = [];
+
+  // 분기점 관통: 시작이 분기점이면 체인 반대 방향으로 여러 테이퍼 링 추가
+  if (startIsBranch) {
+    const bone = chain[0];
+    const dirInward = normalize(sub(bone.position, chain[1].position));
+    const baseRadius = bone.radius * density;
+    const [u, v] = orthonormalBasis(dirInward);
+    // 가장 안쪽(좁은)부터 바깥쪽(넓은)으로
+    for (let step = penetrationSteps; step >= 1; step--) {
+      const t = step / penetrationSteps;
+      const depth = baseRadius * penetrationMaxDepth * t;
+      const radius = baseRadius * (penetrationMinRadius + (1 - penetrationMinRadius) * (1 - t));
+      const center = add(bone.position, scale(dirInward, depth));
+      boneRings.push(createRing(center, u, v, radius));
+      ringColors.push(bone.color);
+    }
+  }
+
   for (let ci = 0; ci < chain.length; ci++) {
     const bone = chain[ci];
-    // 로컬 방향: 인접 본 사이의 방향
     let localDir: Vec3;
     if (ci === 0) {
       localDir = normalize(sub(chain[1].position, bone.position));
@@ -140,6 +170,24 @@ function generateChainTube(
     const [u, v] = orthonormalBasis(localDir);
     const radius = bone.radius * density;
     boneRings.push(createRing(bone.position, u, v, radius));
+    ringColors.push(bone.color);
+  }
+
+  // 분기점 관통: 끝이 분기점이면 체인 진행 방향으로 여러 테이퍼 링 추가
+  if (endIsBranch) {
+    const bone = chain[chain.length - 1];
+    const dirInward = normalize(sub(bone.position, chain[chain.length - 2].position));
+    const baseRadius = bone.radius * density;
+    const [u, v] = orthonormalBasis(dirInward);
+    // 바깥쪽(넓은)부터 안쪽(좁은)으로
+    for (let step = 1; step <= penetrationSteps; step++) {
+      const t = step / penetrationSteps;
+      const depth = baseRadius * penetrationMaxDepth * t;
+      const radius = baseRadius * (penetrationMinRadius + (1 - penetrationMinRadius) * (1 - t));
+      const center = add(bone.position, scale(dirInward, depth));
+      boneRings.push(createRing(center, u, v, radius));
+      ringColors.push(bone.color);
+    }
   }
 
   // 링 정렬 (비틀림 최소화)
@@ -147,42 +195,45 @@ function generateChainTube(
     boneRings[i] = alignRing(boneRings[i - 1], boneRings[i]);
   }
 
-  // 각 본 쌍 사이에 중간 프레임 생성 및 브리지
+  // 각 링 쌍 사이를 세그먼트로 보간 + 브리지
   let prevRingIndices: number[] | null = null;
   let firstRingIndices: number[] | null = null;
 
-  for (let ci = 0; ci < chain.length - 1; ci++) {
-    const boneA = chain[ci];
-    const boneB = chain[ci + 1];
+  for (let ci = 0; ci < boneRings.length - 1; ci++) {
     const ringA = boneRings[ci];
     const ringB = boneRings[ci + 1];
+    const colorA = ringColors[ci];
+    const colorB = ringColors[ci + 1];
 
-    // boneA 위치의 링 (첫 세그먼트이거나 이전과 공유)
     let currentIndices: number[];
     if (prevRingIndices) {
-      currentIndices = prevRingIndices;  // 이전 세그먼트의 끝 링 재사용
+      currentIndices = prevRingIndices;
     } else {
-      const colorA = boneA.color;
       currentIndices = pushRing(b, ringA, colorA);
       firstRingIndices = currentIndices;
     }
 
     // 중간 프레임 생성 + 브리지
-    const localDir = normalize(sub(boneB.position, boneA.position));
+    const centerA = ringCenter(ringA);
+    const centerB = ringCenter(ringB);
+    const localDir = normalize(sub(centerB, centerA));
     const [mu, mv] = orthonormalBasis(localDir);
+
+    // 각 링 쌍의 대략적 반지름 계산
+    const radiusA = distance(ringA[0], ringCenter(ringA));
+    const radiusB = distance(ringB[0], ringCenter(ringB));
 
     for (let s = 1; s <= segments; s++) {
       const t = s / segments;
-      const center = lerp(boneA.position, boneB.position, t);
-      const radius = boneA.radius * (1 - t) + boneB.radius * t;
-      const color: Vec3 = lerp(boneA.color, boneB.color, t);
+      const center = lerp(centerA, centerB, t);
+      const radius = radiusA * (1 - t) + radiusB * t;
+      const color: Vec3 = lerp(colorA, colorB, t);
 
       let ring: Vec3[];
       if (s === segments) {
-        // 마지막 링 = boneB 위치의 프리셋 링 사용
         ring = ringB;
       } else {
-        ring = createRing(center, mu, mv, radius * density);
+        ring = createRing(center, mu, mv, radius);
         ring = alignRing(boneRings[ci], ring);
       }
 
@@ -194,6 +245,7 @@ function generateChainTube(
     prevRingIndices = currentIndices;
   }
 
+  // 실제 체인 본 기준의 시작/끝 링 반환 (관통 링 포함된 상태)
   return {
     startRing: boneRings[0],
     endRing: boneRings[boneRings.length - 1],
@@ -202,64 +254,207 @@ function generateChainTube(
   };
 }
 
-// ─── 분기 노드 브리징 ──────────────────────────────────
+// ─── 정점 용접 (Vertex Welding) ──────────────────────────
 
-function generateBranchBridge(
-  b: MeshBuilder,
-  branchBone: Bone,
-  neighborBones: Bone[],
-  density: number,
-  neighborRingIndices: Map<string, number[]>,
-): void {
-  const center = branchBone.position;
-  const radius = branchBone.radius * density;
-  const color = branchBone.color;
+/**
+ * 거리 threshold 이내의 정점들을 하나로 병합.
+ * 공간 해싱(grid hash)으로 효율적으로 가까운 정점을 찾아 Union-Find로 그룹화.
+ */
+function weldVertices(builder: MeshBuilder, threshold: number = 0.02): void {
+  const vc = builder.vertexCount;
+  if (vc === 0) return;
 
-  // 분기점에 작은 구체 생성 (4 stacks으로 가벼움)
-  const stacks = 4, slices = N_GON;
-  const sphereStartIdx = b.vertexCount;
-  for (let lat = 0; lat <= stacks; lat++) {
-    const theta = (Math.PI * lat) / stacks;
-    const sinT = Math.sin(theta), cosT = Math.cos(theta);
-    for (let lon = 0; lon <= slices; lon++) {
-      const phi = (TWO_PI * lon) / slices;
-      const x = sinT * Math.cos(phi), y = cosT, z = sinT * Math.sin(phi);
-      const normal: Vec3 = [x, y, z];
-      pushVertex(b, add(center, scale(normal, radius * 0.7)), normal, color);
+  const cellSize = threshold;
+  const invCell = 1.0 / cellSize;
+
+  // Union-Find
+  const parent = new Int32Array(vc);
+  const rank = new Int32Array(vc);
+  for (let i = 0; i < vc; i++) parent[i] = i;
+
+  function find(x: number): number {
+    while (parent[x] !== x) {
+      parent[x] = parent[parent[x]]; // path compression
+      x = parent[x];
+    }
+    return x;
+  }
+
+  function union(a: number, b: number): void {
+    const ra = find(a), rb = find(b);
+    if (ra === rb) return;
+    if (rank[ra] < rank[rb]) parent[ra] = rb;
+    else if (rank[ra] > rank[rb]) parent[rb] = ra;
+    else { parent[rb] = ra; rank[ra]++; }
+  }
+
+  // 공간 해싱: 각 셀에 정점 인덱스 저장
+  const grid = new Map<string, number[]>();
+
+  function cellKey(x: number, y: number, z: number): string {
+    const cx = Math.floor(x * invCell);
+    const cy = Math.floor(y * invCell);
+    const cz = Math.floor(z * invCell);
+    return `${cx},${cy},${cz}`;
+  }
+
+  for (let i = 0; i < vc; i++) {
+    const px = builder.positions[i * 3];
+    const py = builder.positions[i * 3 + 1];
+    const pz = builder.positions[i * 3 + 2];
+    const key = cellKey(px, py, pz);
+    let list = grid.get(key);
+    if (!list) { list = []; grid.set(key, list); }
+    list.push(i);
+  }
+
+  // 각 정점에 대해 자신의 셀 + 인접 26셀 탐색
+  const thresholdSq = threshold * threshold;
+
+  for (let i = 0; i < vc; i++) {
+    const px = builder.positions[i * 3];
+    const py = builder.positions[i * 3 + 1];
+    const pz = builder.positions[i * 3 + 2];
+    const cx = Math.floor(px * invCell);
+    const cy = Math.floor(py * invCell);
+    const cz = Math.floor(pz * invCell);
+
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dz = -1; dz <= 1; dz++) {
+          const key = `${cx + dx},${cy + dy},${cz + dz}`;
+          const list = grid.get(key);
+          if (!list) continue;
+          for (const j of list) {
+            if (j <= i) continue; // 중복 방지
+            const dpx = builder.positions[j * 3] - px;
+            const dpy = builder.positions[j * 3 + 1] - py;
+            const dpz = builder.positions[j * 3 + 2] - pz;
+            if (dpx * dpx + dpy * dpy + dpz * dpz < thresholdSq) {
+              union(i, j);
+            }
+          }
+        }
+      }
     }
   }
-  // 구체 면 생성
-  for (let lat = 0; lat < stacks; lat++) {
-    for (let lon = 0; lon < slices; lon++) {
-      const a = sphereStartIdx + lat * (slices + 1) + lon;
-      const c = a + slices + 1;
-      b.indices.push(a, c, a + 1);
-      b.indices.push(a + 1, c, c + 1);
+
+  // 각 그룹의 대표 정점 결정 및 평균 위치/색상 계산
+  const groupMembers = new Map<number, number[]>();
+  for (let i = 0; i < vc; i++) {
+    const root = find(i);
+    let members = groupMembers.get(root);
+    if (!members) { members = []; groupMembers.set(root, members); }
+    members.push(i);
+  }
+
+  // 각 그룹의 평균 위치/색상으로 대표 정점 업데이트
+  for (const [_root, members] of groupMembers) {
+    if (members.length <= 1) continue;
+    let ax = 0, ay = 0, az = 0;
+    let cr = 0, cg = 0, cb = 0;
+    for (const m of members) {
+      ax += builder.positions[m * 3];
+      ay += builder.positions[m * 3 + 1];
+      az += builder.positions[m * 3 + 2];
+      cr += builder.colors[m * 3];
+      cg += builder.colors[m * 3 + 1];
+      cb += builder.colors[m * 3 + 2];
+    }
+    const n = members.length;
+    ax /= n; ay /= n; az /= n;
+    cr /= n; cg /= n; cb /= n;
+    // 모든 멤버의 위치/색상을 평균으로 설정
+    for (const m of members) {
+      builder.positions[m * 3] = ax;
+      builder.positions[m * 3 + 1] = ay;
+      builder.positions[m * 3 + 2] = az;
+      builder.colors[m * 3] = cr;
+      builder.colors[m * 3 + 1] = cg;
+      builder.colors[m * 3 + 2] = cb;
     }
   }
 
-  // 각 이웃 방향의 튜브 끝 링을 구체의 적도 부근 링과 연결
-  for (const nb of neighborBones) {
-    const existingIndices = neighborRingIndices.get(nb.id);
-    if (!existingIndices) continue;
+  // 인덱스 재매핑: 각 정점을 그룹의 대표(최소 인덱스)로
+  const remap = new Int32Array(vc);
+  // 먼저, 새 인덱스 할당 (사용되는 대표 정점만)
+  const newIndexOf = new Int32Array(vc).fill(-1);
+  let newCount = 0;
 
-    // 이웃 방향의 중간 링 생성 (튜브 끝과 구체 사이)
-    const dir = normalize(sub(nb.position, center));
-    const [u, v] = orthonormalBasis(dir);
-    const midCenter = add(center, scale(dir, radius * 0.5));
-    const midRing = createRing(midCenter, u, v, radius * 0.85);
-    const alignedMid = alignRing(
-      existingIndices.map(idx => [
-        b.positions[idx * 3], b.positions[idx * 3 + 1], b.positions[idx * 3 + 2]
-      ] as Vec3),
-      midRing
-    );
-    const midIndices = pushRing(b, alignedMid, color);
-
-    // 튜브 끝 링 → 중간 링 브리지
-    bridgeRingIndices(b, existingIndices, midIndices);
+  for (let i = 0; i < vc; i++) {
+    const root = find(i);
+    if (newIndexOf[root] === -1) {
+      newIndexOf[root] = newCount++;
+    }
+    remap[i] = newIndexOf[root];
   }
+
+  // 새 배열 구축
+  const newPositions: number[] = new Array(newCount * 3);
+  const newNormals: number[] = new Array(newCount * 3);
+  const newColors: number[] = new Array(newCount * 3);
+
+  for (let i = 0; i < vc; i++) {
+    const root = find(i);
+    if (root === i || newIndexOf[root] === remap[i]) {
+      const ni = remap[i];
+      newPositions[ni * 3] = builder.positions[i * 3];
+      newPositions[ni * 3 + 1] = builder.positions[i * 3 + 1];
+      newPositions[ni * 3 + 2] = builder.positions[i * 3 + 2];
+      newNormals[ni * 3] = builder.normals[i * 3];
+      newNormals[ni * 3 + 1] = builder.normals[i * 3 + 1];
+      newNormals[ni * 3 + 2] = builder.normals[i * 3 + 2];
+      newColors[ni * 3] = builder.colors[i * 3];
+      newColors[ni * 3 + 1] = builder.colors[i * 3 + 1];
+      newColors[ni * 3 + 2] = builder.colors[i * 3 + 2];
+    }
+  }
+
+  // 인덱스 재매핑
+  for (let i = 0; i < builder.indices.length; i++) {
+    builder.indices[i] = remap[builder.indices[i]];
+  }
+
+  builder.positions = newPositions;
+  builder.normals = newNormals;
+  builder.colors = newColors;
+  builder.vertexCount = newCount;
 }
+
+// ─── 퇴화 삼각형 제거 ────────────────────────────────────
+
+/**
+ * 같은 정점을 2개 이상 공유하는 삼각형(면적 0) 제거
+ */
+function removeDegenerateTriangles(builder: MeshBuilder): void {
+  const newIndices: number[] = [];
+  for (let i = 0; i < builder.indices.length; i += 3) {
+    const a = builder.indices[i];
+    const b2 = builder.indices[i + 1];
+    const c = builder.indices[i + 2];
+    // 같은 정점이 2개 이상이면 퇴화
+    if (a === b2 || b2 === c || a === c) continue;
+
+    // 면적이 거의 0인 삼각형도 제거
+    const pa: Vec3 = [
+      builder.positions[a * 3], builder.positions[a * 3 + 1], builder.positions[a * 3 + 2]
+    ];
+    const pb: Vec3 = [
+      builder.positions[b2 * 3], builder.positions[b2 * 3 + 1], builder.positions[b2 * 3 + 2]
+    ];
+    const pc: Vec3 = [
+      builder.positions[c * 3], builder.positions[c * 3 + 1], builder.positions[c * 3 + 2]
+    ];
+    const crossVec = cross(sub(pb, pa), sub(pc, pa));
+    const area = length(crossVec);
+    if (area < EPSILON) continue;
+
+    newIndices.push(a, b2, c);
+  }
+  builder.indices = newIndices;
+}
+
+// ─── 기타 기하 생성 ──────────────────────────────────────
 
 function generateSphereMesh(b: MeshBuilder, center: Vec3, radius: number, color: Vec3): void {
   const stacks = 6, slices = N_GON;
@@ -295,14 +490,13 @@ function generateEndCap(b: MeshBuilder, ringIndices: number[], ring: Vec3[], bon
   }
 }
 
-// ─── Laplacian 스무딩 ────────────────────────────────────
+// ─── Taubin 스무딩 ────────────────────────────────────
 
-/** Taubin 스무딩: λ|μ 교대 적용으로 수축 없이 스무딩
- *  λ > 0 (스무딩), μ < 0 (팽창)을 교대 적용 */
-function taubinSmooth(builder: MeshBuilder, iterations: number = 5): void {
+/** Taubin 스무딩: λ|μ 교대 적용으로 수축 없이 스무딩 */
+function taubinSmooth(builder: MeshBuilder, iterations: number = 10): void {
   const vc = builder.vertexCount;
-  const lambda = 0.5;   // 스무딩 강도
-  const mu = -0.53;     // 팽창 강도 (|μ| > λ 이면 수축 방지)
+  const lambda = 0.5;
+  const mu = -0.53;
 
   // 인접 정점 맵 구축
   const adj: Set<number>[] = new Array(vc);
@@ -314,7 +508,7 @@ function taubinSmooth(builder: MeshBuilder, iterations: number = 5): void {
     adj[c].add(a); adj[c].add(b2);
   }
 
-  // 리프 캡 팁 등 경계 정점 고정
+  // 경계 정점 고정
   const pinned = new Uint8Array(vc);
   for (let i = 0; i < vc; i++) {
     if (adj[i].size <= 2) pinned[i] = 1;
@@ -342,8 +536,8 @@ function taubinSmooth(builder: MeshBuilder, iterations: number = 5): void {
   }
 
   for (let iter = 0; iter < iterations; iter++) {
-    smoothPass(lambda);  // 스무딩
-    smoothPass(mu);      // 팽창 (수축 보정)
+    smoothPass(lambda);
+    smoothPass(mu);
   }
 }
 
@@ -370,7 +564,7 @@ function recomputeSmoothNormals(builder: MeshBuilder): void {
   builder.normals = Array.from(normals);
 }
 
-// ─── 체인 탐색: leaf→branch 또는 leaf→leaf ─────────────
+// ─── 체인 탐색 ─────────────────────────────────────────
 
 function findChains(
   bones: Map<string, Bone>,
@@ -380,20 +574,17 @@ function findChains(
   const chains: Bone[][] = [];
   const visitedEdges = new Set<string>();
 
-  // 시작점: leaf(degree 1) 또는 branch(degree 3+)
   const startNodes: string[] = [];
   for (const [id, neighbors] of adjacency) {
     if (neighbors.length !== 2) startNodes.push(id);
   }
 
-  // 각 시작 노드에서 각 방향으로 체인 추적
   for (const startId of startNodes) {
     const neighbors = adjacency.get(startId)!;
     for (const nextId of neighbors) {
       const edgeKey = startId < nextId ? `${startId}-${nextId}` : `${nextId}-${startId}`;
       if (visitedEdges.has(edgeKey)) continue;
 
-      // 체인 추적
       const chain: Bone[] = [];
       const startBone = bones.get(startId);
       if (!startBone || startBone.masked) continue;
@@ -411,9 +602,8 @@ function findChains(
         chain.push(currentBone);
 
         const currentNeighbors = adjacency.get(currentId)!;
-        if (currentNeighbors.length !== 2) break; // branch 또는 leaf에서 종료
+        if (currentNeighbors.length !== 2) break;
 
-        // 다음 본으로 이동 (이전이 아닌 쪽)
         const nextIds = currentNeighbors.filter(id => id !== prevId);
         if (nextIds.length === 0) break;
         prevId = currentId;
@@ -457,25 +647,13 @@ export function generateBMesh(
   // ── 1. 체인 탐색 ──
   const chains = findChains(bones, connections, adjacency);
 
-  // 각 본의 체인 끝 링 인덱스를 추적 (분기점 브리징용)
-  const boneEndRingIndices = new Map<string, number[]>();
-  const boneEndRings = new Map<string, Vec3[]>();
-
-  // ── 2. 각 체인에 대해 연속 튜브 생성 ──
+  // ── 2. 각 체인에 대해 연속 튜브 생성 (분기점 관통 포함) ──
   for (const chain of chains) {
-    const result = generateChainTube(builder, chain, d, segments);
-
-    // 체인의 시작/끝 본 ID와 링 인덱스 기록
-    const startBone = chain[0];
-    const endBone = chain[chain.length - 1];
-
-    boneEndRingIndices.set(`${startBone.id}→${chain[1].id}`, result.startIndices);
-    boneEndRings.set(`${startBone.id}→${chain[1].id}`, result.startRing);
-
-    boneEndRingIndices.set(`${endBone.id}→${chain[chain.length - 2].id}`, result.endIndices);
-    boneEndRings.set(`${endBone.id}→${chain[chain.length - 2].id}`, result.endRing);
+    const result = generateChainTube(builder, chain, d, segments, adjacency);
 
     // ── 리프 노드 캡 ──
+    const startBone = chain[0];
+    const endBone = chain[chain.length - 1];
     const startDeg = adjacency.get(startBone.id)?.length ?? 0;
     const endDeg = adjacency.get(endBone.id)?.length ?? 0;
 
@@ -489,32 +667,7 @@ export function generateBMesh(
     }
   }
 
-  // ── 3. 분기 노드 브리징 ──
-  for (const [boneId, neighborIds] of adjacency) {
-    if (neighborIds.length < 3) continue;
-    const bone = bones.get(boneId);
-    if (!bone || bone.masked) continue;
-
-    const validNeighbors: Bone[] = [];
-    const ringIndicesMap = new Map<string, number[]>();
-
-    for (const nid of neighborIds) {
-      const nb = bones.get(nid);
-      if (!nb || nb.masked) continue;
-      validNeighbors.push(nb);
-
-      // 이 분기 본에서 해당 이웃 방향으로 나가는 체인의 끝 링 찾기
-      const key = `${boneId}→${nid}`;
-      const indices = boneEndRingIndices.get(key);
-      if (indices) ringIndicesMap.set(nid, indices);
-    }
-
-    if (validNeighbors.length >= 2) {
-      generateBranchBridge(builder, bone, validNeighbors, d, ringIndicesMap);
-    }
-  }
-
-  // ── 4. 고립 본 → 구 ──
+  // ── 3. 고립 본 → 구 ──
   for (const bone of bones.values()) {
     if (bone.masked) continue;
     const neighbors = adjacency.get(bone.id);
@@ -523,10 +676,22 @@ export function generateBMesh(
     }
   }
 
-  // ── 5. Taubin 스무딩 (수축 없는 스무딩, 5회) ──
-  taubinSmooth(builder, 5);
+  // ── 4. 정점 용접 (분기 접합부 봉합) ──
+  // threshold는 가장 작은 본 반지름 기준으로 동적 결정
+  let minRadius = Infinity;
+  for (const bone of bones.values()) {
+    if (!bone.masked && bone.radius < minRadius) minRadius = bone.radius;
+  }
+  const weldThreshold = Math.max(0.01, minRadius * d * 0.08);
+  weldVertices(builder, weldThreshold);
 
-  // ── 6. 스무스 노멀 ──
+  // ── 5. 퇴화 삼각형 제거 ──
+  removeDegenerateTriangles(builder);
+
+  // ── 6. Taubin 스무딩 (12회 — 강한 스무딩으로 용접 부위 자연스럽게) ──
+  taubinSmooth(builder, 12);
+
+  // ── 7. 스무스 노멀 재계산 ──
   recomputeSmoothNormals(builder);
 
   return {
