@@ -60,6 +60,8 @@ export default function LeftPanel() {
       <div className="bg-white rounded-xl shadow-sm p-4 space-y-2">
         <SectionHeader title="PRESETS" />
         <Button label="Biped" onClick={() => eventBus.emit('preset:load', { preset: 'biped' })} fullWidth />
+        <Button label="Dog" onClick={() => eventBus.emit('preset:load', { preset: 'dog' })} fullWidth />
+        <Button label="Walking Man" onClick={() => eventBus.emit('preset:load', { preset: 'walking_man' })} fullWidth />
       </div>
     </>
   );

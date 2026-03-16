@@ -13,7 +13,7 @@ import { useEditorStore } from './store/editorStore';
 import { useMeshStore } from './store/meshStore';
 import { ProjectIO } from './io/ProjectIO';
 import { eventBus } from './core/EventBus';
-import { BIPED_PRESET } from './mesh/Presets';
+import { BIPED_PRESET, DOG_PRESET, WALKING_MAN_PRESET, ALL_PRESETS } from './mesh/Presets';
 
 export default function App() {
   const sceneRef = useRef<SceneManager | null>(null);
@@ -179,10 +179,9 @@ export default function App() {
     eventBus.emit('mesh:updated', { meshData });
   }, []);
 
-  const loadBipedPreset = useCallback(() => {
+  const loadPreset = useCallback((preset: typeof BIPED_PRESET) => {
     const meshStore = useMeshStore.getState();
-    const { bones, connections } = BIPED_PRESET;
-    // Build childIds from parentId relationships
+    const { bones, connections } = preset;
     const fullBones = bones.map(b => ({ ...b, childIds: [] as string[] }));
     for (const b of fullBones) {
       if (b.parentId) {
@@ -214,8 +213,8 @@ export default function App() {
     const meshRenderer = new MeshRenderer(scene);
     rendererRef.current = meshRenderer;
 
-    // Load Biped preset
-    loadBipedPreset();
+    // Load default preset
+    loadPreset(BIPED_PRESET);
 
     // Auto-save
     ProjectIO.enableAutoSave();
@@ -253,8 +252,20 @@ export default function App() {
       camera.setView(direction as '+X' | '-X' | '+Y' | '-Y' | '+Z' | '-Z');
     });
 
-    eventBus.on('preset:load', () => {
-      loadBipedPreset();
+    eventBus.on('preset:load', ({ preset: presetName }) => {
+      const presetMap: Record<string, typeof BIPED_PRESET> = {
+        biped: BIPED_PRESET,
+        dog: DOG_PRESET,
+        walking_man: WALKING_MAN_PRESET,
+      };
+      const selectedPreset = presetMap[presetName] ?? BIPED_PRESET;
+      // Dog preset needs higher resolution for detailed features
+      if (presetName === 'dog' || presetName === 'walking_man') {
+        useEditorStore.getState().setMeshResolution(96);
+      } else {
+        useEditorStore.getState().setMeshResolution(64);
+      }
+      loadPreset(selectedPreset);
     });
 
     eventBus.on('project:new', () => {
@@ -282,7 +293,7 @@ export default function App() {
       camera.dispose();
       scene.dispose();
     };
-  }, [loadBipedPreset, regenerateMesh]);
+  }, [loadPreset, regenerateMesh]);
 
   const handleUnmount = useCallback(() => {
     const scene = sceneRef.current;

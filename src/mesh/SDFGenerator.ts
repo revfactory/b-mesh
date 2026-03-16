@@ -78,9 +78,24 @@ export function generate(
   const field = new Float32Array(total);
   field.fill(1e10);
 
-  const k = 0.15; // smooth min factor — lower = sharper separation between bones
+  const k = 0.12; // smooth min factor — lower = sharper separation between bones
 
-  // Precompute bone data
+  // 연결된 본 ID 집합 (캡슐 SDF가 커버하므로 구체 불필요)
+  const connectedBoneIds = new Set<string>();
+  for (const conn of connections) {
+    connectedBoneIds.add(conn.boneA);
+    connectedBoneIds.add(conn.boneB);
+  }
+
+  // 고립/리프 본만 구체 SDF 사용 (연결된 본은 캡슐이 커버)
+  const sphereBones: { pos: Vec3; radius: number }[] = [];
+  for (const bone of allBones) {
+    if (!connectedBoneIds.has(bone.id)) {
+      sphereBones.push({ pos: bone.position, radius: bone.radius * density });
+    }
+  }
+
+  // Precompute bone data (for color assignment later, not for SDF)
   const bonePositions = allBones.map(b => b.position);
   const boneRadii = allBones.map(b => b.radius * density);
 
@@ -111,17 +126,18 @@ export function generate(
 
         let d = 1e10;
 
-        // Sphere SDF for each bone
-        for (let bi = 0; bi < allBones.length; bi++) {
-          const sd = sphereSDF(p, bonePositions[bi], boneRadii[bi]);
-          d = smoothMin(d, sd, k);
-        }
-
-        // Capsule SDF for each connection
+        // Capsule SDF for each connection (주요 기하 — 매끄러운 튜브)
         for (let ci = 0; ci < connData.length; ci++) {
           const c = connData[ci];
           const cd = capsuleSDF(p, c.a, c.b, c.ra, c.rb);
           d = smoothMin(d, cd, k);
+        }
+
+        // Sphere SDF only for isolated bones (연결 없는 고립 본만)
+        for (let si = 0; si < sphereBones.length; si++) {
+          const sb = sphereBones[si];
+          const sd = sphereSDF(p, sb.pos, sb.radius);
+          d = smoothMin(d, sd, k);
         }
 
         field[baseIdx + ix] = d;
