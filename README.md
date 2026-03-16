@@ -4,6 +4,7 @@
 
 ![B-Mesh Editor](docs/screenshot.png)
 ![B-Mesh Wireframe](docs/screenshot-wireframe.png)
+![B-Mesh Walking Man](docs/screenshot-dog.png)
 
 ## 기술 스택
 
