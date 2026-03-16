@@ -1,8 +1,8 @@
 # B-Mesh — 3D Mesh Editor
 
-본(Bone) 기반 절차적 메시 생성 에디터. SDF(Signed Distance Field)와 Marching Cubes 알고리즘으로 본 구조에서 3D 메시를 실시간 생성합니다.
+본(Bone) 기반 절차적 메시 생성 에디터. Cross-section Lofting과 로컬 SDF 하이브리드 알고리즘으로 본 구조에서 3D 메시를 실시간 생성합니다.
 
-![B-Mesh Editor](https://github.com/user-attachments/assets/placeholder.png)
+![B-Mesh Editor](docs/screenshot.png)
 
 ## 기술 스택
 
@@ -14,15 +14,35 @@
 | 스타일링 | Tailwind CSS 4 |
 | 빌드 | Vite 6 |
 
+## 메시 생성 알고리즘
+
+B-Mesh 논문(Ji et al. 2010)에서 영감을 받은 하이브리드 방식:
+
+```
+Bone Skeleton → Chain Detection → Cross-section Lofting (팔다리)
+                                → Local SDF + Marching Cubes (분기점)
+                                → Vertex Welding → Taubin Smoothing → Mesh
+```
+
+### 팔다리: Cross-section Lofting
+- 본 체인을 따라 12각형 단면 프레임을 행진(march)
+- 인접 프레임을 쿼드 면으로 연결하여 튜브 메시 생성
+- 본 방향을 따르는 자연스러운 edge flow
+
+### 분기점: 로컬 SDF 하이브리드
+- 분기 노드(어깨/골반 등) 주변에만 SDF 필드 생성
+- 소규모 Marching Cubes(해상도 32)로 자연스러운 접합 메시 추출
+- 튜브와 SDF 메시를 정점 용접(vertex welding)으로 봉합
+
+### 후처리
+- **정점 용접**: 공간 해싱 + Union-Find로 가까운 정점 자동 병합
+- **퇴화 삼각형 제거**: 면적 0인 삼각형 정리
+- **Taubin 스무딩**: λ|μ 교대 적용으로 수축 없이 18회 스무딩
+
 ## 주요 기능
 
-### 메시 생성 파이프라인
-- **Bone → SDF → Marching Cubes → Mesh**
-- 본 배치로부터 스칼라 필드 생성 (구체/캡슐 SDF + Smooth Minimum)
-- 표준 256 케이스 Marching Cubes로 폴리곤 메시 추출
-- 본 영역별 거리 가중 색상 할당
-
 ### 스컬프팅 도구
+
 | 도구 | 단축키 | 기능 |
 |------|--------|------|
 | Draw | `D` | 클릭 위치에 본 추가 |
@@ -36,7 +56,7 @@
 - **6방향 카메라 프리셋** — +X, -X, +Y, -Y, +Z, -Z
 
 ### 렌더링 모드
-- **Solid** — 본 영역 색상 셰이더
+- **Solid** — 본 영역 색상 셰이더 (GLSL)
 - **Wireframe** — 와이어프레임 오버레이
 - **Vertex** — 정점 포인트 표시
 - **Mesh Preview** — 스무스 노멀 프리뷰
@@ -62,26 +82,27 @@ pnpm dev
 
 ```
 src/
-├── engine/          # Three.js 렌더링 엔진
+├── engine/            # Three.js 렌더링 엔진
 │   ├── SceneManager.ts
 │   ├── CameraController.ts
 │   ├── MeshRenderer.ts
 │   ├── RaycastManager.ts
 │   └── GridHelper.ts
-├── mesh/            # 본/메시 시스템
+├── mesh/              # 본/메시 시스템
+│   ├── BMeshLofting.ts    # 하이브리드 메시 생성 (핵심)
 │   ├── BoneSystem.ts
 │   ├── SDFGenerator.ts
 │   ├── MarchingCubes.ts
 │   ├── SculptTools.ts
 │   ├── SymmetryManager.ts
 │   └── Presets.ts
-├── ui/              # React UI
+├── ui/                # React UI
 │   ├── EditorLayout.tsx
 │   ├── panels/
 │   └── components/
-├── store/           # Zustand 상태 관리
-├── io/              # 파일 I/O
-├── core/            # EventBus, CommandManager
+├── store/             # Zustand 상태 관리
+├── io/                # 파일 I/O
+├── core/              # EventBus, CommandManager
 └── App.tsx
 ```
 
@@ -89,8 +110,13 @@ src/
 
 | 파라미터 | 범위 | 설명 |
 |---------|------|------|
-| Bone Density | 0.1 ~ 10.0 | 본 영향 반경 배율 |
-| Mesh Resolution | 8 ~ 128 | Marching Cubes 그리드 해상도 |
+| Bone Density | 0.1 ~ 5.0 | 본 영향 반경 배율 |
+| Mesh Resolution | 8 ~ 128 | 본당 세그먼트 수 (resolution / 8) |
+
+## 참고 논문
+
+- Ji, Z., Liu, L., Wang, Y. (2010). *"B-Mesh: A Modeling System for Base Meshes of 3D Articulated Shapes."* Computer Graphics Forum, 29(7).
+- Baerentzen, J.A. et al. (2012). *"Converting Skeletal Structures to Quad Dominant Meshes."* Computers & Graphics, 36(5).
 
 ## 라이선스
 
