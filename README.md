@@ -3,6 +3,7 @@
 본(Bone) 기반 절차적 메시 생성 에디터. Cross-section Lofting과 로컬 SDF 하이브리드 알고리즘으로 본 구조에서 3D 메시를 실시간 생성합니다.
 
 ![B-Mesh Editor](docs/screenshot.png)
+![B-Mesh Wireframe](docs/screenshot-wireframe.png)
 
 ## 기술 스택
 
