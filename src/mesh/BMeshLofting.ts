@@ -1,12 +1,15 @@
 // ============================================================
-// B-Mesh Cross-section Lofting — 튜브 관통 + 정점 용접 방식
-// 분기점에서 튜브를 관통시키고 정점 용접으로 자연스러운 접합
+// B-Mesh Cross-section Lofting — 로컬 SDF 하이브리드 방식
+// 튜브는 분기점에서 정확히 끝나고, 분기점 주변만 SDF→MC로 접합
 // ============================================================
 
 import type { BoneStructure, Bone, BoneConnection, MeshData, Vec3 } from './types';
 import {
   add, sub, scale, normalize, cross, dot, length, lerp, distance,
+  smoothMin,
 } from '../core/math';
+import { generate as generateSDF } from './SDFGenerator';
+import { extract as extractMesh } from './MarchingCubes';
 
 const N_GON = 12;
 const TWO_PI = Math.PI * 2;
@@ -108,12 +111,12 @@ function getNeighborIds(boneId: string, connections: BoneConnection[]): string[]
   return neighbors;
 }
 
-// ─── 핵심: 연속 튜브 생성 (분기점 관통 포함) ─────────────
+// ─── 핵심: 연속 튜브 생성 (관통 제거) ─────────────────────
 
 /**
  * 본 체인(leaf→...→branch 또는 leaf→...→leaf)을 따라 연속 튜브 생성.
- * 분기점(degree >= 3)이 체인 끝에 있으면, 튜브를 분기점 중심 안쪽으로
- * 약간 더 연장하여 여러 튜브가 분기점에서 겹치도록 한다.
+ * 관통(penetration) 없음 — 튜브는 분기점 본 위치에서 정확히 끝남.
+ * 분기점 끝은 약간 테이퍼(축소)하여 SDF 메시와 자연스럽게 겹치도록 함.
  */
 function generateChainTube(
   b: MeshBuilder,
@@ -122,40 +125,15 @@ function generateChainTube(
   segments: number,
   adjacency: Map<string, string[]>,
 ): { startRing: Vec3[]; endRing: Vec3[]; startIndices: number[]; endIndices: number[] } {
-  const overallDir = normalize(sub(chain[chain.length - 1].position, chain[0].position));
-  const [baseU, baseV] = orthonormalBasis(overallDir);
-
   // 체인 시작/끝이 분기점인지 확인
   const startDeg = adjacency.get(chain[0].id)?.length ?? 0;
   const endDeg = adjacency.get(chain[chain.length - 1].id)?.length ?? 0;
   const startIsBranch = startDeg >= 3;
   const endIsBranch = endDeg >= 3;
 
-  // 관통 깊이/테이퍼 설정
-  const penetrationSteps = 3;       // 관통 링 개수
-  const penetrationMaxDepth = 0.5;  // 최대 관통 깊이 (반지름 비율)
-  const penetrationMinRadius = 0.3; // 관통 끝 반지름 비율
-
-  // 각 본 위치에 링 생성 (분기점이면 관통 위치 추가)
+  // 각 본 위치에 링 생성 — 관통 없음
   const boneRings: Vec3[][] = [];
   const ringColors: Vec3[] = [];
-
-  // 분기점 관통: 시작이 분기점이면 체인 반대 방향으로 여러 테이퍼 링 추가
-  if (startIsBranch) {
-    const bone = chain[0];
-    const dirInward = normalize(sub(bone.position, chain[1].position));
-    const baseRadius = bone.radius * density;
-    const [u, v] = orthonormalBasis(dirInward);
-    // 가장 안쪽(좁은)부터 바깥쪽(넓은)으로
-    for (let step = penetrationSteps; step >= 1; step--) {
-      const t = step / penetrationSteps;
-      const depth = baseRadius * penetrationMaxDepth * t;
-      const radius = baseRadius * (penetrationMinRadius + (1 - penetrationMinRadius) * (1 - t));
-      const center = add(bone.position, scale(dirInward, depth));
-      boneRings.push(createRing(center, u, v, radius));
-      ringColors.push(bone.color);
-    }
-  }
 
   for (let ci = 0; ci < chain.length; ci++) {
     const bone = chain[ci];
@@ -168,26 +146,18 @@ function generateChainTube(
       localDir = normalize(sub(chain[ci + 1].position, chain[ci - 1].position));
     }
     const [u, v] = orthonormalBasis(localDir);
-    const radius = bone.radius * density;
+    let radius = bone.radius * density;
+
+    // 분기점 끝은 약간 축소하여 SDF 메시와 겹침 영역 확보
+    if (ci === 0 && startIsBranch) {
+      radius *= 0.80;
+    }
+    if (ci === chain.length - 1 && endIsBranch) {
+      radius *= 0.80;
+    }
+
     boneRings.push(createRing(bone.position, u, v, radius));
     ringColors.push(bone.color);
-  }
-
-  // 분기점 관통: 끝이 분기점이면 체인 진행 방향으로 여러 테이퍼 링 추가
-  if (endIsBranch) {
-    const bone = chain[chain.length - 1];
-    const dirInward = normalize(sub(bone.position, chain[chain.length - 2].position));
-    const baseRadius = bone.radius * density;
-    const [u, v] = orthonormalBasis(dirInward);
-    // 바깥쪽(넓은)부터 안쪽(좁은)으로
-    for (let step = 1; step <= penetrationSteps; step++) {
-      const t = step / penetrationSteps;
-      const depth = baseRadius * penetrationMaxDepth * t;
-      const radius = baseRadius * (penetrationMinRadius + (1 - penetrationMinRadius) * (1 - t));
-      const center = add(bone.position, scale(dirInward, depth));
-      boneRings.push(createRing(center, u, v, radius));
-      ringColors.push(bone.color);
-    }
   }
 
   // 링 정렬 (비틀림 최소화)
@@ -219,7 +189,6 @@ function generateChainTube(
     const localDir = normalize(sub(centerB, centerA));
     const [mu, mv] = orthonormalBasis(localDir);
 
-    // 각 링 쌍의 대략적 반지름 계산
     const radiusA = distance(ringA[0], ringCenter(ringA));
     const radiusB = distance(ringB[0], ringCenter(ringB));
 
@@ -245,13 +214,95 @@ function generateChainTube(
     prevRingIndices = currentIndices;
   }
 
-  // 실제 체인 본 기준의 시작/끝 링 반환 (관통 링 포함된 상태)
   return {
     startRing: boneRings[0],
     endRing: boneRings[boneRings.length - 1],
     startIndices: firstRingIndices!,
     endIndices: prevRingIndices!,
   };
+}
+
+// ─── 로컬 SDF 분기점 메시 생성 ──────────────────────────
+
+/**
+ * 분기 노드 주변에 로컬 SDF→Marching Cubes로 매끈한 접합부 메시 생성.
+ * 분기 본과 인접 본들만 포함하는 작은 BoneStructure를 만들어 SDF 생성.
+ */
+function generateLocalBranchMesh(
+  builder: MeshBuilder,
+  branchBone: Bone,
+  neighborBones: Bone[],
+  density: number,
+  connections: BoneConnection[],
+): void {
+  // 분기 본 + 인접 본들로 로컬 BoneStructure 생성
+  const localBones = new Map<string, Bone>();
+  localBones.set(branchBone.id, branchBone);
+  for (const nb of neighborBones) {
+    // 인접 본을 원래 위치에 두되, 분기점~인접점 중간까지만 사용
+    // (너무 멀리까지 포함하면 튜브 영역과 겹침이 과해짐)
+    const midPos: Vec3 = lerp(branchBone.position, nb.position, 0.5);
+    const midRadius = branchBone.radius * 0.5 + nb.radius * 0.5;
+    const virtualBone: Bone = {
+      ...nb,
+      id: nb.id + '_local',
+      position: midPos,
+      radius: midRadius,
+    };
+    localBones.set(virtualBone.id, virtualBone);
+  }
+
+  // 로컬 연결 생성
+  const localConnections: BoneConnection[] = [];
+  for (const nb of neighborBones) {
+    localConnections.push({
+      boneA: branchBone.id,
+      boneB: nb.id + '_local',
+      strength: 1,
+    });
+  }
+
+  const localStructure: BoneStructure = {
+    bones: localBones,
+    connections: localConnections,
+    rootId: branchBone.id,
+  };
+
+  // 로컬 SDF 생성 (해상도 32, 작은 영역이므로 빠름)
+  const sdfInfo = generateSDF(localStructure, 32, density);
+
+  // Marching Cubes 추출
+  const allLocalBones = Array.from(localBones.values());
+  const localMesh = extractMesh(sdfInfo, 0.0, allLocalBones);
+
+  // 로컬 메시를 빌더에 추가
+  if (localMesh.positions.length === 0) return;
+
+  const baseIdx = builder.vertexCount;
+  const vertCount = localMesh.positions.length / 3;
+
+  for (let i = 0; i < vertCount; i++) {
+    builder.positions.push(
+      localMesh.positions[i * 3],
+      localMesh.positions[i * 3 + 1],
+      localMesh.positions[i * 3 + 2],
+    );
+    builder.normals.push(
+      localMesh.normals[i * 3],
+      localMesh.normals[i * 3 + 1],
+      localMesh.normals[i * 3 + 2],
+    );
+    builder.colors.push(
+      localMesh.colors[i * 3],
+      localMesh.colors[i * 3 + 1],
+      localMesh.colors[i * 3 + 2],
+    );
+    builder.vertexCount++;
+  }
+
+  for (let i = 0; i < localMesh.indices.length; i++) {
+    builder.indices.push(localMesh.indices[i] + baseIdx);
+  }
 }
 
 // ─── 정점 용접 (Vertex Welding) ──────────────────────────
@@ -364,7 +415,6 @@ function weldVertices(builder: MeshBuilder, threshold: number = 0.02): void {
     const n = members.length;
     ax /= n; ay /= n; az /= n;
     cr /= n; cg /= n; cb /= n;
-    // 모든 멤버의 위치/색상을 평균으로 설정
     for (const m of members) {
       builder.positions[m * 3] = ax;
       builder.positions[m * 3 + 1] = ay;
@@ -375,9 +425,8 @@ function weldVertices(builder: MeshBuilder, threshold: number = 0.02): void {
     }
   }
 
-  // 인덱스 재매핑: 각 정점을 그룹의 대표(최소 인덱스)로
+  // 인덱스 재매핑
   const remap = new Int32Array(vc);
-  // 먼저, 새 인덱스 할당 (사용되는 대표 정점만)
   const newIndexOf = new Int32Array(vc).fill(-1);
   let newCount = 0;
 
@@ -389,7 +438,6 @@ function weldVertices(builder: MeshBuilder, threshold: number = 0.02): void {
     remap[i] = newIndexOf[root];
   }
 
-  // 새 배열 구축
   const newPositions: number[] = new Array(newCount * 3);
   const newNormals: number[] = new Array(newCount * 3);
   const newColors: number[] = new Array(newCount * 3);
@@ -410,7 +458,6 @@ function weldVertices(builder: MeshBuilder, threshold: number = 0.02): void {
     }
   }
 
-  // 인덱스 재매핑
   for (let i = 0; i < builder.indices.length; i++) {
     builder.indices[i] = remap[builder.indices[i]];
   }
@@ -423,19 +470,14 @@ function weldVertices(builder: MeshBuilder, threshold: number = 0.02): void {
 
 // ─── 퇴화 삼각형 제거 ────────────────────────────────────
 
-/**
- * 같은 정점을 2개 이상 공유하는 삼각형(면적 0) 제거
- */
 function removeDegenerateTriangles(builder: MeshBuilder): void {
   const newIndices: number[] = [];
   for (let i = 0; i < builder.indices.length; i += 3) {
     const a = builder.indices[i];
     const b2 = builder.indices[i + 1];
     const c = builder.indices[i + 2];
-    // 같은 정점이 2개 이상이면 퇴화
     if (a === b2 || b2 === c || a === c) continue;
 
-    // 면적이 거의 0인 삼각형도 제거
     const pa: Vec3 = [
       builder.positions[a * 3], builder.positions[a * 3 + 1], builder.positions[a * 3 + 2]
     ];
@@ -492,13 +534,11 @@ function generateEndCap(b: MeshBuilder, ringIndices: number[], ring: Vec3[], bon
 
 // ─── Taubin 스무딩 ────────────────────────────────────
 
-/** Taubin 스무딩: λ|μ 교대 적용으로 수축 없이 스무딩 */
 function taubinSmooth(builder: MeshBuilder, iterations: number = 10): void {
   const vc = builder.vertexCount;
   const lambda = 0.5;
   const mu = -0.53;
 
-  // 인접 정점 맵 구축
   const adj: Set<number>[] = new Array(vc);
   for (let i = 0; i < vc; i++) adj[i] = new Set();
   for (let i = 0; i < builder.indices.length; i += 3) {
@@ -508,7 +548,6 @@ function taubinSmooth(builder: MeshBuilder, iterations: number = 10): void {
     adj[c].add(a); adj[c].add(b2);
   }
 
-  // 경계 정점 고정
   const pinned = new Uint8Array(vc);
   for (let i = 0; i < vc; i++) {
     if (adj[i].size <= 2) pinned[i] = 1;
@@ -647,7 +686,7 @@ export function generateBMesh(
   // ── 1. 체인 탐색 ──
   const chains = findChains(bones, connections, adjacency);
 
-  // ── 2. 각 체인에 대해 연속 튜브 생성 (분기점 관통 포함) ──
+  // ── 2. 각 체인에 대해 연속 튜브 생성 (관통 없음) ──
   for (const chain of chains) {
     const result = generateChainTube(builder, chain, d, segments, adjacency);
 
@@ -667,7 +706,25 @@ export function generateBMesh(
     }
   }
 
-  // ── 3. 고립 본 → 구 ──
+  // ── 3. 분기 노드에 로컬 SDF 메시 생성 ──
+  for (const bone of bones.values()) {
+    if (bone.masked) continue;
+    const neighborIds = adjacency.get(bone.id);
+    if (!neighborIds || neighborIds.length < 3) continue;
+
+    // 분기점: 인접 본들 수집
+    const neighborBones: Bone[] = [];
+    for (const nId of neighborIds) {
+      const nb = bones.get(nId);
+      if (nb && !nb.masked) neighborBones.push(nb);
+    }
+
+    if (neighborBones.length >= 2) {
+      generateLocalBranchMesh(builder, bone, neighborBones, d, connections);
+    }
+  }
+
+  // ── 4. 고립 본 → 구 ──
   for (const bone of bones.values()) {
     if (bone.masked) continue;
     const neighbors = adjacency.get(bone.id);
@@ -676,22 +733,21 @@ export function generateBMesh(
     }
   }
 
-  // ── 4. 정점 용접 (분기 접합부 봉합) ──
-  // threshold는 가장 작은 본 반지름 기준으로 동적 결정
+  // ── 5. 정점 용접 (튜브-SDF 접합부 봉합) ──
   let minRadius = Infinity;
   for (const bone of bones.values()) {
     if (!bone.masked && bone.radius < minRadius) minRadius = bone.radius;
   }
-  const weldThreshold = Math.max(0.01, minRadius * d * 0.08);
+  const weldThreshold = Math.max(0.01, minRadius * d * 0.15);
   weldVertices(builder, weldThreshold);
 
-  // ── 5. 퇴화 삼각형 제거 ──
+  // ── 6. 퇴화 삼각형 제거 ──
   removeDegenerateTriangles(builder);
 
-  // ── 6. Taubin 스무딩 (12회 — 강한 스무딩으로 용접 부위 자연스럽게) ──
-  taubinSmooth(builder, 12);
+  // ── 7. Taubin 스무딩 (18회 — SDF-튜브 접합부를 매끄럽게) ──
+  taubinSmooth(builder, 18);
 
-  // ── 7. 스무스 노멀 재계산 ──
+  // ── 8. 스무스 노멀 재계산 ──
   recomputeSmoothNormals(builder);
 
   return {
