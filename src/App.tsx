@@ -6,8 +6,7 @@ import RightPanel from './ui/panels/RightPanel';
 import { useKeyboard } from './ui/hooks/useKeyboard';
 import { SceneManager, CameraController, GridHelper, MeshRenderer } from './engine';
 import { BoneSystem } from './mesh/BoneSystem';
-import { generate as generateSDF } from './mesh/SDFGenerator';
-import { extract as extractMesh } from './mesh/MarchingCubes';
+import { generateBMesh } from './mesh/BMeshLofting';
 import { useEditorStore } from './store/editorStore';
 import { useMeshStore } from './store/meshStore';
 import { ProjectIO } from './io/ProjectIO';
@@ -38,8 +37,7 @@ export default function App() {
     if (bonesArray.length === 0) return;
 
     const structure = boneSystem.structure;
-    const sdfInfo = generateSDF(structure, editor.meshResolution, editor.boneDensity);
-    const meshData = extractMesh(sdfInfo, 0.0, bonesArray);
+    const meshData = generateBMesh(structure, editor.boneDensity, Math.max(4, Math.floor(editor.meshResolution / 8)));
 
     meshRenderer.updateMesh(meshData);
     meshStore.setMeshData(meshData);
