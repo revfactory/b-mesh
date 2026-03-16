@@ -222,86 +222,120 @@ function generateChainTube(
   };
 }
 
-// ─── 로컬 SDF 분기점 메시 생성 ──────────────────────────
+// ─── SDF 투영: 모든 정점을 SDF 등치면으로 이동 ──────────────────
 
 /**
- * 분기 노드 주변에 로컬 SDF→Marching Cubes로 매끈한 접합부 메시 생성.
- * 분기 본과 인접 본들만 포함하는 작은 BoneStructure를 만들어 SDF 생성.
+ * SDF 필드에서 trilinear interpolation으로 특정 위치의 SDF 값을 계산.
  */
-function generateLocalBranchMesh(
+function sampleSDFAt(sdfInfo: { field: Float32Array; resolution: number; boundsMin: Vec3; boundsMax: Vec3; cellSize: number }, pos: Vec3): number {
+  const { field, resolution: res, boundsMin, cellSize } = sdfInfo;
+  // 연속 격자 좌표
+  const fx = (pos[0] - boundsMin[0]) / cellSize;
+  const fy = (pos[1] - boundsMin[1]) / cellSize;
+  const fz = (pos[2] - boundsMin[2]) / cellSize;
+
+  // 경계 클램핑
+  const cx = Math.max(0, Math.min(res - 2, Math.floor(fx)));
+  const cy = Math.max(0, Math.min(res - 2, Math.floor(fy)));
+  const cz = Math.max(0, Math.min(res - 2, Math.floor(fz)));
+
+  const tx = Math.max(0, Math.min(1, fx - cx));
+  const ty = Math.max(0, Math.min(1, fy - cy));
+  const tz = Math.max(0, Math.min(1, fz - cz));
+
+  const idx = (iz: number, iy: number, ix: number) => iz * res * res + iy * res + ix;
+
+  // Trilinear interpolation
+  const c000 = field[idx(cz, cy, cx)];
+  const c100 = field[idx(cz, cy, cx + 1)];
+  const c010 = field[idx(cz, cy + 1, cx)];
+  const c110 = field[idx(cz, cy + 1, cx + 1)];
+  const c001 = field[idx(cz + 1, cy, cx)];
+  const c101 = field[idx(cz + 1, cy, cx + 1)];
+  const c011 = field[idx(cz + 1, cy + 1, cx)];
+  const c111 = field[idx(cz + 1, cy + 1, cx + 1)];
+
+  const c00 = c000 * (1 - tx) + c100 * tx;
+  const c10 = c010 * (1 - tx) + c110 * tx;
+  const c01 = c001 * (1 - tx) + c101 * tx;
+  const c11 = c011 * (1 - tx) + c111 * tx;
+
+  const c0 = c00 * (1 - ty) + c10 * ty;
+  const c1 = c01 * (1 - ty) + c11 * ty;
+
+  return c0 * (1 - tz) + c1 * tz;
+}
+
+/**
+ * SDF 필드에서 특정 위치의 gradient 계산 (중앙 차분).
+ */
+function sdfGradientAt(sdfInfo: { field: Float32Array; resolution: number; boundsMin: Vec3; boundsMax: Vec3; cellSize: number }, pos: Vec3): Vec3 {
+  const h = sdfInfo.cellSize * 0.5;
+  const dx = sampleSDFAt(sdfInfo, [pos[0] + h, pos[1], pos[2]]) - sampleSDFAt(sdfInfo, [pos[0] - h, pos[1], pos[2]]);
+  const dy = sampleSDFAt(sdfInfo, [pos[0], pos[1] + h, pos[2]]) - sampleSDFAt(sdfInfo, [pos[0], pos[1] - h, pos[2]]);
+  const dz = sampleSDFAt(sdfInfo, [pos[0], pos[1], pos[2] + h]) - sampleSDFAt(sdfInfo, [pos[0], pos[1], pos[2] - h]);
+  const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  if (len < 1e-10) return [0, 0, 0];
+  return [dx / len, dy / len, dz / len];
+}
+
+/**
+ * 모든 정점을 SDF iso-surface(SDF=0)로 투영.
+ * 분기점 근처 정점들이 SDF 표면으로 자연스럽게 끌려가 이음새가 사라짐.
+ */
+function projectVerticesToSDF(
   builder: MeshBuilder,
-  branchBone: Bone,
-  neighborBones: Bone[],
-  density: number,
-  connections: BoneConnection[],
+  sdfInfo: { field: Float32Array; resolution: number; boundsMin: Vec3; boundsMax: Vec3; cellSize: number },
+  branchPositions: Vec3[],
+  branchInfluenceRadius: number,
 ): void {
-  // 분기 본 + 인접 본들로 로컬 BoneStructure 생성
-  const localBones = new Map<string, Bone>();
-  localBones.set(branchBone.id, branchBone);
-  for (const nb of neighborBones) {
-    // 인접 본을 원래 위치에 두되, 분기점~인접점 중간까지만 사용
-    // (너무 멀리까지 포함하면 튜브 영역과 겹침이 과해짐)
-    const midPos: Vec3 = lerp(branchBone.position, nb.position, 0.5);
-    const midRadius = branchBone.radius * 0.5 + nb.radius * 0.5;
-    const virtualBone: Bone = {
-      ...nb,
-      id: nb.id + '_local',
-      position: midPos,
-      radius: midRadius,
-    };
-    localBones.set(virtualBone.id, virtualBone);
-  }
+  const vc = builder.vertexCount;
 
-  // 로컬 연결 생성
-  const localConnections: BoneConnection[] = [];
-  for (const nb of neighborBones) {
-    localConnections.push({
-      boneA: branchBone.id,
-      boneB: nb.id + '_local',
-      strength: 1,
-    });
-  }
+  for (let i = 0; i < vc; i++) {
+    const px = builder.positions[i * 3];
+    const py = builder.positions[i * 3 + 1];
+    const pz = builder.positions[i * 3 + 2];
 
-  const localStructure: BoneStructure = {
-    bones: localBones,
-    connections: localConnections,
-    rootId: branchBone.id,
-  };
+    // 분기점과의 최소 거리 계산 → 영향 가중치
+    let minBranchDist = Infinity;
+    for (const bp of branchPositions) {
+      const dx = px - bp[0], dy = py - bp[1], dz = pz - bp[2];
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (dist < minBranchDist) minBranchDist = dist;
+    }
 
-  // 로컬 SDF 생성 (해상도 32, 작은 영역이므로 빠름)
-  const sdfInfo = generateSDF(localStructure, 32, density);
+    // 분기점에서 멀면 투영하지 않음 (튜브 영역은 유지)
+    // 분기점 근처일수록 강하게 투영
+    if (minBranchDist > branchInfluenceRadius) continue;
 
-  // Marching Cubes 추출
-  const allLocalBones = Array.from(localBones.values());
-  const localMesh = extractMesh(sdfInfo, 0.0, allLocalBones);
+    // 영향도: 분기점에 가까울수록 1, 멀수록 0 (smooth falloff)
+    const t = minBranchDist / branchInfluenceRadius;
+    const influence = 1.0 - t * t * (3.0 - 2.0 * t); // smoothstep
 
-  // 로컬 메시를 빌더에 추가
-  if (localMesh.positions.length === 0) return;
+    if (influence < 0.01) continue;
 
-  const baseIdx = builder.vertexCount;
-  const vertCount = localMesh.positions.length / 3;
+    // Newton-Raphson 스타일 SDF 투영
+    let pos: Vec3 = [px, py, pz];
+    for (let iter = 0; iter < 12; iter++) {
+      const sdfVal = sampleSDFAt(sdfInfo, pos);
+      if (Math.abs(sdfVal) < 1e-5) break;
 
-  for (let i = 0; i < vertCount; i++) {
-    builder.positions.push(
-      localMesh.positions[i * 3],
-      localMesh.positions[i * 3 + 1],
-      localMesh.positions[i * 3 + 2],
-    );
-    builder.normals.push(
-      localMesh.normals[i * 3],
-      localMesh.normals[i * 3 + 1],
-      localMesh.normals[i * 3 + 2],
-    );
-    builder.colors.push(
-      localMesh.colors[i * 3],
-      localMesh.colors[i * 3 + 1],
-      localMesh.colors[i * 3 + 2],
-    );
-    builder.vertexCount++;
-  }
+      const grad = sdfGradientAt(sdfInfo, pos);
+      if (grad[0] === 0 && grad[1] === 0 && grad[2] === 0) break;
 
-  for (let i = 0; i < localMesh.indices.length; i++) {
-    builder.indices.push(localMesh.indices[i] + baseIdx);
+      // SDF 값 방향으로 이동 (surface로 수렴)
+      const step = sdfVal * 0.85;
+      pos = [
+        pos[0] - grad[0] * step,
+        pos[1] - grad[1] * step,
+        pos[2] - grad[2] * step,
+      ];
+    }
+
+    // 영향도에 따라 블렌딩
+    builder.positions[i * 3] = px + (pos[0] - px) * influence;
+    builder.positions[i * 3 + 1] = py + (pos[1] - py) * influence;
+    builder.positions[i * 3 + 2] = pz + (pos[2] - pz) * influence;
   }
 }
 
@@ -706,22 +740,24 @@ export function generateBMesh(
     }
   }
 
-  // ── 3. 분기 노드에 로컬 SDF 메시 생성 ──
+  // ── 3. SDF 투영: 분기점 근처 정점들을 SDF 등치면으로 투영 ──
+  const branchPositions: Vec3[] = [];
+  let maxBranchRadius = 0;
   for (const bone of bones.values()) {
     if (bone.masked) continue;
     const neighborIds = adjacency.get(bone.id);
-    if (!neighborIds || neighborIds.length < 3) continue;
-
-    // 분기점: 인접 본들 수집
-    const neighborBones: Bone[] = [];
-    for (const nId of neighborIds) {
-      const nb = bones.get(nId);
-      if (nb && !nb.masked) neighborBones.push(nb);
+    if (neighborIds && neighborIds.length >= 3) {
+      branchPositions.push(bone.position);
+      if (bone.radius * d > maxBranchRadius) maxBranchRadius = bone.radius * d;
     }
+  }
 
-    if (neighborBones.length >= 2) {
-      generateLocalBranchMesh(builder, bone, neighborBones, d, connections);
-    }
+  if (branchPositions.length > 0) {
+    // 전체 SDF 필드 생성 (해상도 64)
+    const sdfInfo = generateSDF(structure, 64, d);
+    // 분기점 영향 반경: 분기점 주변 본 반경의 3배
+    const influenceRadius = maxBranchRadius * 3.0;
+    projectVerticesToSDF(builder, sdfInfo, branchPositions, influenceRadius);
   }
 
   // ── 4. 고립 본 → 구 ──
@@ -733,19 +769,19 @@ export function generateBMesh(
     }
   }
 
-  // ── 5. 정점 용접 (튜브-SDF 접합부 봉합) ──
+  // ── 5. 정점 용접 (분기점 근처 겹친 정점 병합) ──
   let minRadius = Infinity;
   for (const bone of bones.values()) {
     if (!bone.masked && bone.radius < minRadius) minRadius = bone.radius;
   }
-  const weldThreshold = Math.max(0.01, minRadius * d * 0.15);
+  const weldThreshold = Math.max(0.01, minRadius * d * 0.12);
   weldVertices(builder, weldThreshold);
 
   // ── 6. 퇴화 삼각형 제거 ──
   removeDegenerateTriangles(builder);
 
-  // ── 7. Taubin 스무딩 (18회 — SDF-튜브 접합부를 매끄럽게) ──
-  taubinSmooth(builder, 18);
+  // ── 7. Taubin 스무딩 (12회 — SDF 투영 후 미세 스무딩) ──
+  taubinSmooth(builder, 12);
 
   // ── 8. 스무스 노멀 재계산 ──
   recomputeSmoothNormals(builder);
